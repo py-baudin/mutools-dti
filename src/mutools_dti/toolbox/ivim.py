@@ -4,7 +4,7 @@ from mutools.toolbox.common import dicom, handlers
 
 @ma.machine()
 @ma.input("stack")
-@ma.output("ivim", handler=handlers.universal_handler)
+@ma.output("ivim", handler=handlers.default_handler)
 def ivim(stack):
     from mutools_dti import ivim
 
