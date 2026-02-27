@@ -213,14 +213,20 @@ def dti_register(data, satmask):
             n.replace("dwi_ste", "saturation_mask") for n in mask_transforms.keys()
         ]
 
-        ref_m = [satvol[name] for name in ref_name_m]
+        if ref_name_m:
+            ref_m = [satvol[name] for name in ref_name_m]
         mov_m = [satvol[name] for name in mov_names_m]
         mask_t = elastix.transform(list(mask_transforms.values()), mov_m)
-        empty = (0 * ref_m[0].copy()).astype(bool)
+        if ref_name_m:
+            empty = (0 * ref_m[0].copy()).astype(bool)
+        else:
+            tmp = satvol[mov_names_m[0]]
+            empty = (0 * tmp[0].copy()).astype(bool)
         mask_t = [empty + (np.asarray(mask) > 0.5) for mask in mask_t]
 
         # store
-        registered.update({name: vol for name, vol in zip(ref_name_m, ref_m)})
+        if ref_name_m:
+            registered.update({name: vol for name, vol in zip(ref_name_m, ref_m)})
         registered.update({name: vol for name, vol in zip(mov_names_m, mask_t)})
     
     
