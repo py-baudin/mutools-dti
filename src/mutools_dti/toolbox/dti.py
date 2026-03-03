@@ -603,6 +603,248 @@ def dti_tensorcalc(data, avg="_wmap_weighted_mean", testing="False"):
     }
 
 
+@ma.machine()
+@ma.input("data", "dti_fit", handler=default_handler)
+@ma.input("mask", "dti_denoised", handler=default_handler)
+@ma.output("dti_rpbm", handler=default_handler)
+@ma.parameter("difftimes", default=[116.3,216.3,316.3,416.3])
+@ma.parameter("QC", default=False)
+@ma.parameter("fit_method", default='dictionary')
+# Options: 'dictionary', 'lsq'
+@ma.parameter("RPBM_dict", default='')
+def dti_rpbm(data, mask, difftimes=[116.3,216.3,316.3,416.3], QC=False, fit_method='dictionary', RPBM_dict=''):
+    """ Estimate RPBM parameters """
+    import numpy as np
+    from scipy import ndimage, stats
+    from scipy.optimize import curve_fit
+    from mutools_dti import utils, rpbm
+    from mutools import io
+
+    # Difftimes list may be handled as str...
+    if isinstance(difftimes, str):
+        difftimes = difftimes.strip("[]")
+        difftimes = [float(x) for x in difftimes.split(",")]
+
+    if fit_method == 'dictionary':
+        # Load or generate dictionary
+        if not RPBM_dict:
+            print(f"No RPBM dictionary provided. Generate dictionary.")
+            rpbmdict = rpbm.RPBM_Dictionary(1000, 500, difftimes, rpbm.rpbm_calc_dt)
+        else:
+            try:
+                _rpbmdict = np.load(RPBM_dict)
+                rpbmdict = rpbm.RPBM_Dictionary.__new__(rpbm.RPBM_Dictionary)
+                rpbmdict.__dict__.update({k: _rpbmdict[k] for k in _rpbmdict.files})
+
+                print(f"Dictionary found and loaded: {RPBM_dict}")
+
+            except ValueError:
+                _rpbmdict = np.load(RPBM_dict, allow_pickle=True)
+                rpbmdict = _rpbmdict['arr_0'].item()
+
+                print(f"Dictionary found and loaded: {RPBM_dict}")
+
+            except FileNotFoundError:
+                print(f"Provided RPBM dictionary file does not exist!")
+
+    # Load and prepare mask
+    mask = mask["volumes"]
+    mask = mask['dwi_ste_tm100_ro01_mask']
+    mask = ndimage.binary_fill_holes(mask, axes=(0,1))
+
+    # Load and prepare data
+    db = utils.NanoDB(data["info"]["metadata"])
+
+    vols = data["volumes"]
+    ADs = {k: v for k, v in vols.items() if k.endswith("_e1")}
+    RDs = {k: v for k, v in vols.items() if k.endswith("_RD")}
+
+    volADs = [ADs[f] for f in ADs]
+    volRDs = [RDs[f] for f in RDs]
+
+    AD = np.stack(volADs, axis=-1)
+    RD = np.stack(volRDs, axis=-1)
+
+    # Fix AD to AD(TM>100ms)
+    Dfix = np.nanmean(AD[...,1::], axis=-1)
+    uDfix = np.nanstd(AD[...,1::], axis=-1, ddof=1)
+
+    # QC step: Create mask
+    finite_mask = np.all(np.isfinite(RD), axis=-1) & np.isfinite(Dfix)
+
+    if (QC==True) | (QC=='True') | (QC==1):
+        print(f"Use finite mask and enforce decreasing RD as quality control")
+        # RDmask = np.all(np.diff(RD, axis=-1) < 0, axis=-1)    # Too strict
+        RDmed = np.nanmedian(RD, axis=-1)
+        eps = 0.01 * RDmed[... ,np.newaxis]
+        eps_end = 0.005 * RDmed
+        dRD = np.diff(RD, axis=-1)
+        viol = np.sum(dRD > eps, axis=-1)
+        max_viol = 1
+        ddRD = RD[...,0] >= (RD[..., -1] - eps_end)
+        RDmask = ddRD & (viol <= max_viol) & (RDmed > 0)
+
+        valid_mask = finite_mask & RDmask
+    else:
+        print(f"Use finite mask and denoising mask")
+        valid_mask = finite_mask & mask
+
+    # Flatten arrays
+    N = np.prod(volRDs[0].shape)
+    TMs = len(difftimes)
+    RD_flat = RD.reshape(N, TMs)
+    Dfix_flat = Dfix.reshape(N)
+    uDfix_flat = uDfix.reshape(N)
+    valid_idx = np.where(valid_mask.reshape(N))[0]
+
+    # Allocate outputs
+    acorr = np.full(N, np.nan, dtype=np.float32)
+    kappa = np.full(N, np.nan, dtype=np.float32)
+    SV    = np.full(N, np.nan, dtype=np.float32)
+    tau   = np.full(N, np.nan, dtype=np.float32)
+    zeta  = np.full(N, np.nan, dtype=np.float32)
+    tortuosity = np.full(N, np.nan, dtype=np.float32)
+    TD    = np.full(N, np.nan, dtype=np.float32)
+    TR    = np.full(N, np.nan, dtype=np.float32)
+    uacorr = np.full(N, np.nan, dtype=np.float32)
+    ukappa = np.full(N, np.nan, dtype=np.float32)
+    uSV    = np.full(N, np.nan, dtype=np.float32)
+    utau   = np.full(N, np.nan, dtype=np.float32)
+    uzeta  = np.full(N, np.nan, dtype=np.float32)
+    utortuosity = np.full(N, np.nan, dtype=np.float32)
+    uTD    = np.full(N, np.nan, dtype=np.float32)
+    uTR    = np.full(N, np.nan, dtype=np.float32)
+
+
+    if fit_method == 'lsq':
+        def fit_func(t, tau, zeta, Dfix_i):
+            return Dfix_i * np.array([rpbm.rpbm_calc_dt(ti / tau, zeta) for ti in t])
+
+    for idx in valid_idx:
+        iRD = RD_flat[idx,:]
+        iDfix = Dfix_flat[idx]
+        iuDfix = uDfix_flat[idx]
+
+        if fit_method == 'lsq':
+            params, pcov = curve_fit(
+                lambda t, tau, zeta: fit_func(t, tau, zeta, iDfix),
+                difftimes,
+                iRD,
+                p0=[300, 2],    # tau[ms], zeta
+                bounds=([0, 0], [np.inf, np.inf]),
+                maxfev = 10000,
+            )
+
+            tau_fit, zeta_fit = params
+
+            # confidence intervals for processing (95%)
+            alpha = 0.05
+            n = len(iRD)
+            dof = max(0, n - 2)
+            tval = stats.t.ppf(1.0 - alpha / 2., dof) if dof > 0 else 1.96
+            conf_int = tval * np.sqrt(np.diag(pcov))
+
+            confidence = [[iuDfix, iuDfix],
+                          [tau_fit - conf_int[0], tau_fit + conf_int[0]],
+                          [zeta_fit - conf_int[1], zeta_fit + conf_int[1]]]
+
+        elif fit_method == 'dictionary':
+            tau_fit, zeta_fit, tau_list, zeta_list = rpbm.match_rpbm_robust(iRD, iDfix, rpbmdict)
+
+            # Confidence intervals either 95% (2.5/97.5 percentiles) or 1sigma (16/84 percentiles)
+            tau_l = np.percentile(tau_list, 2.5)
+            tau_h = np.percentile(tau_list, 97.5)
+            zeta_l = np.percentile(zeta_list, 2.5)
+            zeta_h = np.percentile(zeta_list, 97.5)
+
+            confidence = [[iuDfix, iuDfix],
+                          [tau_l, tau_h],
+                          [zeta_l, zeta_h]]
+
+        else:
+            raise Exception("Unknown fit method given as input.")
+
+        rpbm_params, urpbm_params = rpbm.rpbm_process(
+            [iDfix, tau_fit, zeta_fit],
+            confidence
+        )
+
+        acorr[idx] = rpbm_params.get("a_corr", np.nan)
+        kappa[idx] = rpbm_params.get("kappa", np.nan)
+        SV[idx] = rpbm_params.get("SV", np.nan)
+        tau[idx] = rpbm_params.get("tau", np.nan)
+        zeta[idx] = rpbm_params.get("zeta", np.nan)
+        tortuosity[idx] = rpbm_params.get("tortuosity", np.nan)
+        TD[idx] = rpbm_params.get("TD", np.nan)
+        TR[idx] = rpbm_params.get("TR", np.nan)
+
+        uacorr[idx] = urpbm_params.get("a_corr", np.nan)
+        ukappa[idx] = urpbm_params.get("kappa", np.nan)
+        uSV[idx] = urpbm_params.get("SV", np.nan)
+        utau[idx] = urpbm_params.get("tau", np.nan)
+        uzeta[idx] = urpbm_params.get("zeta", np.nan)
+        utortuosity[idx] = urpbm_params.get("tortuosity", np.nan)
+        uTD[idx] = urpbm_params.get("TD", np.nan)
+        uTR[idx] = urpbm_params.get("TR", np.nan)
+
+    # Reshape back
+    acorr = acorr.reshape(volRDs[0].shape)
+    kappa = kappa.reshape(volRDs[0].shape)
+    SV = SV.reshape(volRDs[0].shape)
+    tau = tau.reshape(volRDs[0].shape)
+    zeta = zeta.reshape(volRDs[0].shape)
+    tortuosity = tortuosity.reshape(volRDs[0].shape)
+    TD = TD.reshape(volRDs[0].shape)
+    TR = TR.reshape(volRDs[0].shape)
+
+    uacorr = uacorr.reshape(volRDs[0].shape)
+    ukappa = ukappa.reshape(volRDs[0].shape)
+    uSV = uSV.reshape(volRDs[0].shape)
+    utau = utau.reshape(volRDs[0].shape)
+    uzeta = uzeta.reshape(volRDs[0].shape)
+    utortuosity = utortuosity.reshape(volRDs[0].shape)
+    uTD = uTD.reshape(volRDs[0].shape)
+    uTR = uTR.reshape(volRDs[0].shape)
+
+    # Clip parameter maps to realistic values (exclude outliers)
+    acorr[acorr>500] = np.nan
+    kappa[kappa>1] = np.nan
+    SV[SV>1] = np.nan
+    tau[tau>10000] = np.nan
+    zeta[zeta>10] = np.nan
+    tortuosity[tortuosity>20] = np.nan
+    TD[TD>100000] = np.nan
+    TR[TR>100000] = np.nan
+
+    # Use metadata of first RD
+    meta = getattr(volRDs[0], "meta", {})
+
+    return {
+        "volumes":{
+            "RPBM_acorr": io.Volume(acorr, **meta),
+            "RPBM_kappa": io.Volume(kappa, **meta),
+            "RPBM_SV": io.Volume(SV, **meta),
+            "RPBM_tau": io.Volume(tau, **meta),
+            "RPBM_zeta": io.Volume(zeta, **meta),
+            "RPBM_tortuosity": io.Volume(tortuosity, **meta),
+            "RPBM_Td": io.Volume(TD, **meta),
+            "RPBM_Tr": io.Volume(TR, **meta),
+            "RPBM_uacorr": io.Volume(uacorr, **meta),
+            "RPBM_ukappa": io.Volume(ukappa, **meta),
+            "RPBM_uSV": io.Volume(uSV, **meta),
+            "RPBM_utau": io.Volume(utau, **meta),
+            "RPBM_uzeta": io.Volume(uzeta, **meta),
+            "RPBM_utortuosity": io.Volume(utortuosity, **meta),
+            "RPBM_uTd": io.Volume(uTD, **meta),
+            "RPBM_uTr": io.Volume(uTR, **meta),
+            "denoised_mask": io.Volume(mask, **meta),
+            "finite_mask": io.Volume(finite_mask, **meta),
+            "valid_mask": io.Volume(valid_mask, **meta)
+        },
+        "info": {"metadata": db},
+    }
+
+
 # @ma.machine()
 # @ma.input('dti', handler=default_handler)
 # @ma.input('roi', type='roi', variable=True)
