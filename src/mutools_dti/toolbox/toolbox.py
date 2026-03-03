@@ -19,6 +19,7 @@ toolbox.add_program('dti-regmaskSNR', dti.dti_regmaskSNR, group=group)
 toolbox.add_program('dti-dofs', dti.dti_dofs, group=group)
 toolbox.add_program('dti-roi', dti.RoiDTI, group=group)
 toolbox.add_program('dti-tensor', dti.dti_tensorcalc, group=group)
+toolbox.add_program('dti-rpbm', dti.dti_rpbm, group=group)
 
 toolbox.add_program(
     "simple-ivim",
